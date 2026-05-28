@@ -1,15 +1,14 @@
+use std::pin::Pin;
 use std::time::Duration;
 
-use axum::body::Body;
-use axum::extract::State;
-use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use futures::TryStreamExt;
-use http::{HeaderMap, HeaderName, StatusCode};
+use futures::{Stream, TryStreamExt};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use reqwest::Client;
 use serde_json::Value;
+use tracing::warn;
 
-use crate::config::RuntimeConfig;
+use crate::config::Config;
 use crate::error::Error;
 
 const HOP_BY_HOP: &[&str] = &[
@@ -25,8 +24,6 @@ const HOP_BY_HOP: &[&str] = &[
 
 const REQUEST_DROP_EXTRA: &[&str] = &["host", "content-length"];
 
-const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
-
 fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
@@ -35,9 +32,26 @@ fn is_request_drop(name: &str) -> bool {
     is_hop_by_hop(name) || REQUEST_DROP_EXTRA.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
+pub struct ProxyRequest {
+    pub headers: HeaderMap,
+    pub body: Bytes,
+    pub query: Option<String>,
+}
+
+pub enum ProxyBody {
+    Full(Bytes),
+    Stream(Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>),
+}
+
+pub struct ProxyResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: ProxyBody,
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
-    pub config: RuntimeConfig,
+    pub config: Config,
     pub stream_client: Client,
     pub non_stream_client: Client,
 }
@@ -45,10 +59,11 @@ pub struct ProxyState {
 impl ProxyState {
     /// # Errors
     ///
-    /// Returns an error if the HTTP clients cannot be built (e.g. invalid TLS backend).
-    pub fn new(config: RuntimeConfig) -> Result<Self, Error> {
+    /// Returns an error if the HTTP clients cannot be built.
+    pub fn new(config: Config) -> Result<Self, Error> {
         let stream_client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(900))
             .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -69,7 +84,7 @@ impl ProxyState {
     }
 }
 
-fn filter_request_headers(headers: &HeaderMap, config: &RuntimeConfig) -> reqwest::header::HeaderMap {
+fn filter_request_headers(headers: &HeaderMap, config: &Config) -> reqwest::header::HeaderMap {
     let mut out = reqwest::header::HeaderMap::new();
     for (name, value) in headers {
         if is_request_drop(name.as_str()) {
@@ -77,7 +92,7 @@ fn filter_request_headers(headers: &HeaderMap, config: &RuntimeConfig) -> reqwes
         }
         if let Ok(n) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
             if let Ok(v) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
-                out.insert(n, v);
+                out.append(n, v);
             }
         }
     }
@@ -104,8 +119,8 @@ fn filter_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
             continue;
         }
         if let Ok(n) = HeaderName::from_bytes(name.as_str().as_bytes()) {
-            if let Ok(v) = http::HeaderValue::from_bytes(value.as_bytes()) {
-                out.insert(n, v);
+            if let Ok(v) = HeaderValue::from_bytes(value.as_bytes()) {
+                out.append(n, v);
             }
         }
     }
@@ -119,7 +134,8 @@ fn is_sse_content_type(headers: &reqwest::header::HeaderMap) -> bool {
         .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/event-stream"))
 }
 
-fn proxy_error(status: StatusCode, code: &str, message: &str) -> Response {
+#[must_use]
+pub fn error_response(status: StatusCode, code: &str, message: &str) -> ProxyResponse {
     let body = serde_json::json!({
         "error": {
             "message": message,
@@ -128,25 +144,26 @@ fn proxy_error(status: StatusCode, code: &str, message: &str) -> Response {
             "code": code,
         }
     });
-    (status, axum::Json(body)).into_response()
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    ProxyResponse {
+        status,
+        headers,
+        body: ProxyBody::Full(Bytes::from(serde_json::to_vec(&body).unwrap_or_default())),
+    }
 }
 
-pub async fn proxy_responses(State(state): State<ProxyState>, req: axum::extract::Request) -> Response {
-    let (parts, body) = req.into_parts();
-    let Ok(body_bytes) = axum::body::to_bytes(body, MAX_BODY_SIZE).await else {
-        return proxy_error(StatusCode::BAD_REQUEST, "body_too_large", "Request body too large");
-    };
-
-    let is_streaming = serde_json::from_slice::<Value>(&body_bytes)
+pub async fn proxy_request(request: ProxyRequest, state: &ProxyState) -> ProxyResponse {
+    let is_streaming = serde_json::from_slice::<Value>(&request.body)
         .ok()
         .and_then(|v| v.get("stream")?.as_bool())
         .unwrap_or(false);
 
-    let vllm_headers = filter_request_headers(&parts.headers, &state.config);
+    let llm_headers = filter_request_headers(&request.headers, &state.config);
 
     let base = state.config.llm_api_base.trim_end_matches('/');
     let mut url = format!("{base}/v1/responses");
-    if let Some(q) = parts.uri.query() {
+    if let Some(q) = &request.query {
         url.push('?');
         url.push_str(q);
     }
@@ -157,66 +174,68 @@ pub async fn proxy_responses(State(state): State<ProxyState>, req: axum::extract
         &state.non_stream_client
     };
 
-    let vllm_resp = match client.post(&url).headers(vllm_headers).body(body_bytes).send().await {
+    let llm_resp = match client.post(&url).headers(llm_headers).body(request.body).send().await {
         Ok(r) => r,
         Err(e) if e.is_timeout() => {
-            return proxy_error(StatusCode::GATEWAY_TIMEOUT, "vllm_timeout", "vLLM timeout");
+            warn!("LLM request timed out: {e}");
+            return error_response(StatusCode::GATEWAY_TIMEOUT, "llm_timeout", "LLM timeout");
         }
-        Err(_) => {
-            return proxy_error(StatusCode::BAD_GATEWAY, "vllm_unavailable", "vLLM unavailable");
+        Err(e) => {
+            warn!("LLM request failed: {e}");
+            return error_response(StatusCode::BAD_GATEWAY, "llm_unavailable", "LLM unavailable");
         }
     };
 
-    let status = StatusCode::from_u16(vllm_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut response_headers = filter_response_headers(vllm_resp.headers());
+    let status = StatusCode::from_u16(llm_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response_headers = filter_response_headers(llm_resp.headers());
 
-    if is_sse_content_type(vllm_resp.headers()) {
-        response_headers.insert("x-accel-buffering", http::HeaderValue::from_static("no"));
+    if is_sse_content_type(llm_resp.headers()) {
+        response_headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
 
-        let byte_stream = vllm_resp.bytes_stream().map_err(std::io::Error::other);
+        let byte_stream = llm_resp.bytes_stream().map_err(std::io::Error::other);
 
-        let body = Body::from_stream(byte_stream);
-        let mut resp = Response::new(body);
-        *resp.status_mut() = status;
-        *resp.headers_mut() = response_headers;
-        return resp;
+        return ProxyResponse {
+            status,
+            headers: response_headers,
+            body: ProxyBody::Stream(Box::pin(byte_stream)),
+        };
     }
 
-    let payload: Bytes = match vllm_resp.bytes().await {
+    let payload: Bytes = match llm_resp.bytes().await {
         Ok(b) => b,
-        Err(_) => {
-            return proxy_error(
+        Err(e) => {
+            warn!("failed to read LLM response body: {e}");
+            return error_response(
                 StatusCode::BAD_GATEWAY,
-                "vllm_unavailable",
-                "Failed to read vLLM response",
+                "llm_unavailable",
+                "Failed to read LLM response",
             );
         }
     };
 
-    let mut resp = Response::new(Body::from(payload));
-    *resp.status_mut() = status;
-    *resp.headers_mut() = response_headers;
-    resp
+    ProxyResponse {
+        status,
+        headers: response_headers,
+        body: ProxyBody::Full(payload),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RuntimeConfig;
+    use crate::config::Config;
 
-    fn test_config() -> RuntimeConfig {
-        RuntimeConfig {
+    fn test_config() -> Config {
+        Config {
             llm_api_base: "http://localhost:8000".to_owned(),
             openai_api_key: Some("test-key".to_owned()),
-            gateway_host: "127.0.0.1".to_owned(),
-            gateway_port: 0,
-            vllm_ready_timeout_s: 5.0,
-            vllm_ready_interval_s: 0.1,
+            llm_ready_timeout_s: 5.0,
+            llm_ready_interval_s: 0.1,
         }
     }
 
-    fn test_config_no_key() -> RuntimeConfig {
-        RuntimeConfig {
+    fn test_config_no_key() -> Config {
+        Config {
             openai_api_key: None,
             ..test_config()
         }
@@ -307,7 +326,7 @@ mod tests {
     #[test]
     fn no_auth_injected_when_key_empty() {
         let headers = HeaderMap::new();
-        let config = RuntimeConfig {
+        let config = Config {
             openai_api_key: Some("  ".to_owned()),
             ..test_config()
         };
