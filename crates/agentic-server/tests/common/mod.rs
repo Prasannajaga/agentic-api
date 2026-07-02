@@ -29,7 +29,6 @@ pub fn test_state(config: &Config) -> AppState {
         ResponseHandler::new(ResponseStore::disabled()),
         Arc::new(reqwest::Client::new()),
         config.llm_api_base.clone(),
-        config.openai_api_key.clone(),
     ));
     let proxy_state = ProxyState::new(config.clone()).expect("proxy state");
     AppState {
@@ -37,6 +36,7 @@ pub fn test_state(config: &Config) -> AppState {
         exec_ctx,
         shutdown_token: CancellationToken::new(),
         llm_api_base: config.llm_api_base.clone(),
+        openai_api_key: config.openai_api_key.clone(),
     }
 }
 

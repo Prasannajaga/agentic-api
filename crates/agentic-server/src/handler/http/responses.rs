@@ -4,11 +4,13 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use either::Either;
 
-use agentic_core::executor::execute;
+use std::sync::Arc;
+
+use agentic_core::executor::ExecuteRequest;
 use agentic_core::proxy::{ProxyRequest, proxy_request};
 use agentic_core::types::request_response::RequestPayload;
 
-use super::super::common::{convert_response, executor_error_response, read_and_parse, resolve_exec_ctx, sse_response};
+use super::super::common::{convert_response, executor_error_response, extract_bearer, read_and_parse, sse_response};
 use crate::app::AppState;
 
 async fn proxy_responses(state: &AppState, parts: Parts, body: Bytes) -> Response {
@@ -21,7 +23,12 @@ async fn proxy_responses(state: &AppState, parts: Parts, body: Bytes) -> Respons
 }
 
 async fn execute_responses(state: &AppState, parts: Parts, payload: RequestPayload) -> Response {
-    match execute(payload, resolve_exec_ctx(state, &parts)).await {
+    let auth = extract_bearer(&parts.headers, state.openai_api_key.as_deref());
+    match ExecuteRequest::new(payload, Arc::clone(&state.exec_ctx))
+        .with_auth(auth)
+        .run()
+        .await
+    {
         Ok(Either::Left(response_payload)) => axum::Json(response_payload).into_response(),
         Ok(Either::Right(stream)) => sse_response(stream),
         Err(e) => executor_error_response(e),

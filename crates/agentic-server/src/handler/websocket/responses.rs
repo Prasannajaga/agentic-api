@@ -19,7 +19,7 @@ use agentic_core::types::ResponsePayload;
 use agentic_core::types::request_response::RequestPayload;
 use agentic_core::utils::common::serialize_to_string;
 
-use super::super::common::{MAX_BODY_SIZE, resolve_exec_ctx_from_headers};
+use super::super::common::{MAX_BODY_SIZE, extract_bearer};
 use super::error::WsError;
 use crate::app::AppState;
 
@@ -119,12 +119,26 @@ async fn handle_ws_text(
     payload.stream = true;
     payload.store = true;
 
-    let exec_ctx = resolve_exec_ctx_from_headers(state, headers);
+    let auth = extract_bearer(headers, state.openai_api_key.as_deref());
+    let exec_ctx = Arc::clone(&state.exec_ctx);
     let ctx = rehydrate_conversation(payload, &exec_ctx).await?;
     let upstream_json =
         serialize_to_string(&ctx.enriched_request.to_upstream_request(true)).map_err(ExecutorError::from)?;
 
-    stream_ws_response(sender, receiver, exec_ctx, ctx, upstream_json, shutdown_token, queue).await
+    let req = WsStreamRequest {
+        exec_ctx,
+        ctx,
+        upstream_json,
+        auth,
+    };
+    stream_ws_response(sender, receiver, req, shutdown_token, queue).await
+}
+
+struct WsStreamRequest {
+    exec_ctx: Arc<ExecutionContext>,
+    ctx: RequestContext,
+    upstream_json: String,
+    auth: Option<String>,
 }
 
 /// Stream a response from the upstream LLM to the client.
@@ -134,12 +148,16 @@ async fn handle_ws_text(
 async fn stream_ws_response(
     sender: &mut WsSender,
     receiver: &mut WsReceiver,
-    exec_ctx: Arc<ExecutionContext>,
-    ctx: RequestContext,
-    upstream_json: String,
+    req: WsStreamRequest,
     shutdown_token: &CancellationToken,
     queue: &mut VecDeque<String>,
 ) -> Result<(), WsError> {
+    let WsStreamRequest {
+        exec_ctx,
+        ctx,
+        upstream_json,
+        auth,
+    } = req;
     let should_persist = ctx.original_request.store
         || ctx.original_request.previous_response_id.is_some()
         || ctx.conversation_id.is_some();
@@ -148,7 +166,7 @@ async fn stream_ws_response(
         upstream_json,
         exec_ctx.responses_url(),
         Arc::clone(&exec_ctx.client),
-        exec_ctx.client_auth.clone(),
+        auth,
         exec_ctx.streaming_timeout,
     ));
 
