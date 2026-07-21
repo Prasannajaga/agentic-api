@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use either::Either;
 use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -25,9 +25,13 @@ type WsSender = SplitSink<WebSocket, Message>;
 type WsReceiver = SplitStream<WebSocket>;
 
 pub async fn responses_ws(State(state): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    let websocket_guard = state.websocket_tracker.track();
     ws.max_message_size(MAX_BODY_SIZE)
         .max_frame_size(MAX_BODY_SIZE)
-        .on_upgrade(move |socket| responses_ws_loop(socket, state, headers))
+        .on_upgrade(move |socket| async move {
+            let _websocket_guard = websocket_guard;
+            responses_ws_loop(socket, state, headers).await;
+        })
 }
 
 async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMap) {
@@ -39,6 +43,9 @@ async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMa
     let mut queue: VecDeque<String> = VecDeque::new();
 
     loop {
+        if shutdown_token.is_cancelled() {
+            break;
+        }
         let text = if let Some(buffered) = queue.pop_front() {
             buffered
         } else {
@@ -92,6 +99,9 @@ async fn responses_ws_loop(socket: WebSocket, state: AppState, headers: HeaderMa
                 }
             }
         }
+    }
+    if let Err(error) = sender.close().await {
+        debug!(%error, "failed to close responses websocket cleanly");
     }
     debug!("responses websocket session closed");
 }
@@ -203,6 +213,35 @@ fn empty_response_event(
     })
 }
 
+enum ShutdownInput<ReceiverItem, UpstreamItem> {
+    Receiver(Option<ReceiverItem>),
+    Upstream(Option<UpstreamItem>),
+}
+
+async fn next_shutdown_input<Receiver, Upstream>(
+    receiver: &mut Receiver,
+    upstream: &mut Upstream,
+    prefer_receiver: bool,
+) -> ShutdownInput<Receiver::Item, Upstream::Item>
+where
+    Receiver: Stream + Unpin,
+    Upstream: Stream + Unpin,
+{
+    if prefer_receiver {
+        tokio::select! {
+            biased;
+            message = receiver.next() => ShutdownInput::Receiver(message),
+            line = upstream.next() => ShutdownInput::Upstream(line),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            line = upstream.next() => ShutdownInput::Upstream(line),
+            message = receiver.next() => ShutdownInput::Receiver(message),
+        }
+    }
+}
+
 /// Stream a response from the executor to the client.
 ///
 /// Requests arriving from the client while the stream is active are pushed
@@ -214,9 +253,38 @@ async fn stream_ws_response(
     shutdown_token: &CancellationToken,
     queue: &mut VecDeque<String>,
 ) -> Result<(), WsError> {
+    let mut prefer_shutdown_receiver = true;
     'stream: loop {
+        if shutdown_token.is_cancelled() {
+            match next_shutdown_input(receiver, &mut stream, prefer_shutdown_receiver).await {
+                ShutdownInput::Receiver(message) => {
+                    prefer_shutdown_receiver = false;
+                    match message {
+                        None | Some(Ok(Message::Close(_))) => return Err(WsError::ClientDisconnected),
+                        Some(Ok(Message::Ping(payload))) => {
+                            sender
+                                .send(Message::Pong(payload))
+                                .await
+                                .map_err(|_| WsError::SendFailed)?;
+                        }
+                        Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Pong(_))) => {}
+                        Some(Err(error)) => return Err(WsError::Receive(error.to_string())),
+                    }
+                    continue 'stream;
+                }
+                ShutdownInput::Upstream(line) => {
+                    prefer_shutdown_receiver = true;
+                    let Some(line) = line else {
+                        break;
+                    };
+                    forward_ws_stream_line(sender, &line).await?;
+                }
+            }
+            continue;
+        }
+
         let next_line = tokio::select! {
-            () = shutdown_token.cancelled() => return Err(WsError::Shutdown),
+            () = shutdown_token.cancelled() => continue 'stream,
             message = receiver.next() => {
                 match message {
                     None | Some(Ok(Message::Close(_))) => return Err(WsError::ClientDisconnected),
@@ -244,26 +312,30 @@ async fn stream_ws_response(
         let Some(line) = next_line else {
             break;
         };
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        let data = data.trim();
-        if data == "[DONE]" {
-            continue;
-        }
-        let value = match serde_json::from_str::<Value>(data) {
-            Ok(value) => value,
-            Err(e) => return Err(WsError::Executor(ExecutorError::from(e))),
-        };
-        send_ws_json(sender, value).await?;
+        forward_ws_stream_line(sender, &line).await?;
     }
 
     Ok(())
 }
 
+async fn forward_ws_stream_line(sender: &mut WsSender, line: &str) -> Result<(), WsError> {
+    let Some(data) = line.strip_prefix("data: ") else {
+        return Ok(());
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Ok(());
+    }
+    let value = match serde_json::from_str::<Value>(data) {
+        Ok(value) => value,
+        Err(e) => return Err(WsError::Executor(ExecutorError::from(e))),
+    };
+    send_ws_json(sender, value).await
+}
+
 async fn handle_ws_error(sender: &mut WsSender, err: WsError) -> bool {
     match err {
-        WsError::Shutdown | WsError::ClientDisconnected | WsError::SendFailed => false,
+        WsError::ClientDisconnected | WsError::SendFailed => false,
         WsError::Receive(message) => {
             warn!("responses websocket receive error: {message}");
             false
@@ -285,4 +357,26 @@ async fn send_ws_json(sender: &mut WsSender, value: Value) -> Result<(), WsError
         .send(Message::Text(text.into()))
         .await
         .map_err(|_| WsError::SendFailed)
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::stream;
+
+    use super::{ShutdownInput, next_shutdown_input};
+
+    #[tokio::test]
+    async fn shutdown_input_priority_alternates_when_both_streams_are_ready() {
+        let mut receiver = stream::repeat(());
+        let mut upstream = stream::repeat(());
+
+        assert!(matches!(
+            next_shutdown_input(&mut receiver, &mut upstream, true).await,
+            ShutdownInput::Receiver(Some(()))
+        ));
+        assert!(matches!(
+            next_shutdown_input(&mut receiver, &mut upstream, false).await,
+            ShutdownInput::Upstream(Some(()))
+        ));
+    }
 }

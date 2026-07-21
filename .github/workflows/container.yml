@@ -1,0 +1,180 @@
+name: Container
+
+on:
+  merge_group:
+  pull_request:
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/container.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - "crates/**"
+      - "scripts/container-fixture-server.py"
+      - "scripts/fixtures/vllm-response-single-nonstreaming.json"
+      - "scripts/test-container-entrypoint.sh"
+  push:
+    branches: [main]
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/container.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "docker-entrypoint.sh"
+      - "crates/**"
+      - "scripts/container-fixture-server.py"
+      - "scripts/fixtures/vllm-response-single-nonstreaming.json"
+      - "scripts/test-container-entrypoint.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Test container entrypoint
+        run: scripts/test-container-entrypoint.sh
+
+      - name: Build runtime image
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build \
+            --build-arg OCI_BUILD_PIPELINE="$GITHUB_WORKFLOW" \
+            --build-arg OCI_BUILD_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --build-arg OCI_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg OCI_REVISION="$GITHUB_SHA" \
+            --build-arg OCI_VERSION="${GITHUB_REF_NAME}" \
+            --tag agentic-api:test \
+            .
+
+      - name: Verify runtime contents and identity
+        run: |
+          docker run --rm --entrypoint sh agentic-api:test -eu -c '
+            for command in cargo rustc python vllm; do
+              ! command -v "$command"
+            done
+            test "$(id -u)" -ne 0
+            test "$(id -g)" -eq 0
+            test ! -w /usr/local/bin/agentic-server
+            test ! -w /usr/local/bin/docker-entrypoint.sh
+          '
+          container_id=$(docker create agentic-api:test)
+          binary_copy=$(mktemp)
+          cleanup_binary() {
+            docker rm --force "$container_id" >/dev/null 2>&1 || true
+            rm -f "$binary_copy"
+          }
+          trap cleanup_binary EXIT
+          docker cp "$container_id:/usr/local/bin/agentic-server" "$binary_copy"
+          binary_description=$(file "$binary_copy")
+          echo "$binary_description"
+          case "$binary_description" in
+            *"not stripped"*) exit 1 ;;
+            *"stripped"*) ;;
+            *) echo "unable to verify that agentic-server is stripped" >&2; exit 1 ;;
+          esac
+          volume_dir=$(mktemp -d)
+          cleanup_volume() {
+            sudo rm -rf "$volume_dir"
+          }
+          trap 'cleanup_binary; cleanup_volume' EXIT
+          sudo chgrp 0 "$volume_dir"
+          chmod 2775 "$volume_dir"
+          docker run --rm --user 12345:0 \
+            --volume "$volume_dir:/var/lib/agentic-api" \
+            --entrypoint sh agentic-api:test \
+            -eu -c 'touch /var/lib/agentic-api/write-check && test -w /var/lib/agentic-api/write-check'
+
+      - name: Test Responses API end to end
+        run: |
+          python3 scripts/container-fixture-server.py \
+            --fixture scripts/fixtures/vllm-response-single-nonstreaming.json \
+            --port 18000 \
+            >/tmp/agentic-api-upstream.log 2>&1 &
+          upstream_pid=$!
+          volume=agentic-api-smoke-data
+          upstream_response_id=$(jq --exit-status --raw-output \
+            '.id | select(type == "string" and length > 0)' \
+            scripts/fixtures/vllm-response-single-nonstreaming.json)
+
+          cleanup() {
+            docker logs agentic-api-smoke 2>/dev/null || true
+            docker rm --force agentic-api-smoke >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+            kill "$upstream_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          start_gateway() {
+            docker run --detach --name agentic-api-smoke --network host --user "$1:0" \
+              --volume "$volume:/var/lib/agentic-api" \
+              --env LLM_API_BASE=http://127.0.0.1:18000 \
+              agentic-api:test
+          }
+
+          wait_until_ready() {
+            for attempt in $(seq 1 30); do
+              if curl --connect-timeout 1 --max-time 3 --fail --silent http://127.0.0.1:9000/health >/dev/null && \
+                 curl --connect-timeout 1 --max-time 3 --fail --silent http://127.0.0.1:9000/ready >/dev/null; then
+                return 0
+              fi
+              echo "gateway not ready (attempt $attempt/30)"
+              sleep 1
+            done
+            return 1
+          }
+
+          post_response() {
+            jq --null-input --compact-output --arg previous_response_id "$1" '
+              {
+                input: "Reply with exactly one word: HELLO",
+                model: "gpt-4o",
+                store: true,
+                stream: false
+              } + if $previous_response_id == "" then {} else {
+                previous_response_id: $previous_response_id
+              } end
+            ' >/tmp/agentic-api-request.json
+            curl --connect-timeout 2 --max-time 15 --fail --silent --show-error \
+              --header 'Content-Type: application/json' \
+              --data-binary @/tmp/agentic-api-request.json \
+              --output "$2" \
+              http://127.0.0.1:9000/v1/responses
+            jq --exit-status --arg upstream_response_id "$upstream_response_id" '
+              .status == "completed" and
+              (.id | startswith("resp_")) and
+              .id != $upstream_response_id and
+              .model == "gpt-4o" and
+              .output[0].content[0].text == "HI"
+            ' "$2"
+          }
+
+          docker volume create "$volume"
+          start_gateway 12345
+          wait_until_ready
+          post_response "" /tmp/agentic-api-response-1.json
+          first_response_id=$(jq --exit-status --raw-output '.id' /tmp/agentic-api-response-1.json)
+          docker exec agentic-api-smoke test -f /var/lib/agentic-api/agentic_api.db
+          docker stop --timeout 10 agentic-api-smoke
+          test "$(docker inspect --format '{{.State.ExitCode}}' agentic-api-smoke)" -eq 0
+          docker rm agentic-api-smoke
+
+          start_gateway 23456
+          wait_until_ready
+          post_response "$first_response_id" /tmp/agentic-api-response-2.json
+          second_response_id=$(jq --exit-status --raw-output '.id' /tmp/agentic-api-response-2.json)
+          post_response "$second_response_id" /tmp/agentic-api-response-3.json
+          if docker logs agentic-api-smoke 2>&1 | grep --quiet 'persist failed'; then
+            echo "SQLite persistence failed after arbitrary-UID rotation" >&2
+            exit 1
+          fi
+          docker stop --timeout 10 agentic-api-smoke
+          test "$(docker inspect --format '{{.State.ExitCode}}' agentic-api-smoke)" -eq 0
